@@ -1,0 +1,6 @@
+httpx
+pydantic
+gradio
+asyncio
+langsmith
+python-dotenv
