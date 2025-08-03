@@ -177,32 +177,24 @@ class MCPClient:
 
 class A2AClient:
     """
-    Agent-to-Agent (A2A) client for multi-agent orchestration and task delegation.
+    Agent-to-Agent (A2A) client using official A2A SDK protocol.
     
-    Provides communication interface with the A2A agents server, enabling
-    coordination between specialized customer support agents (Triage, Email,
-    Documentation, Resolution, Escalation) for comprehensive ticket handling.
+    Implements the correct A2A protocol for multi-agent orchestration and task delegation,
+    following the official A2A SDK documentation and examples.
     
     Features:
-    - Asynchronous message sending to A2A agent orchestrator
-    - Agent card retrieval for system capabilities
-    - Task delegation and multi-agent coordination
-    - Real-time agent communication and status updates
+    - Official A2A SDK protocol implementation
+    - Agent card resolution and caching
+    - Proper message structure with role, parts, and messageId
     - Error handling and timeout management
     
     Attributes:
         server_url (str): URL of the A2A agents server
         client (httpx.AsyncClient): HTTP client for server communication
+        agent_card (dict): Cached agent card from server
         
     Environment Variables:
         A2A_SERVER_URL: A2A agents server URL (default: http://localhost:8000)
-        
-    Agent Types Supported:
-        - triage: Initial request classification and routing
-        - email: Email composition and customer communication
-        - documentation: Document search and knowledge management
-        - resolution: Problem solving and solution generation
-        - escalation: Complex issue handling and expert routing
     """
     
     def __init__(self, server_url: str = None):
@@ -211,21 +203,118 @@ class A2AClient:
         if not self.server_url:
             raise ValueError("A2A Server URL is required (set A2A_SERVER_URL or pass server_url)")
         self.client = httpx.AsyncClient(timeout=30.0)
+        self.agent_card = None
+    
+    async def _get_agent_card(self) -> Dict[str, Any]:
+        """Fetch and cache agent card from A2A server"""
+        if self.agent_card is not None:
+            return self.agent_card
+            
+        try:
+            response = await self.client.get(f"{self.server_url}/.well-known/agent.json")
+            response.raise_for_status()
+            self.agent_card = response.json()
+            return self.agent_card
+        except Exception as e:
+            return {"error": f"Failed to fetch agent card: {str(e)}"}
     
     async def send_message(self, message: str, agent_type: str = "triage") -> Dict[str, Any]:
-        """Send message to A2A agent"""
+        """Send message to A2A agent using official A2A SDK protocol"""
         try:
-            response = await self.client.post(
-                f"{self.server_url}/messages",
-                json={
-                    "message": message,
-                    "agent_type": agent_type,
-                    "timestamp": datetime.now().isoformat()
+            # Get agent card first
+            agent_card = await self._get_agent_card()
+            if "error" in agent_card:
+                return agent_card
+            
+            # Generate unique message ID
+            import uuid
+            message_id = uuid.uuid4().hex
+            request_id = str(uuid.uuid4())
+            
+            # Create A2A protocol message structure
+            a2a_message = {
+                "role": "user",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": f"[{agent_type.upper()}] {message}"
+                    }
+                ],
+                "messageId": message_id
+            }
+            
+            # Create A2A SendMessageRequest payload
+            request_payload = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "message/send",  # Fixed: Use forward slash, not dot
+                "params": {
+                    "message": a2a_message
                 }
+            }
+            
+            # Send request to A2A server
+            response = await self.client.post(
+                self.server_url,  # A2A servers handle JSONRPC at root
+                json=request_payload,
+                headers={"Content-Type": "application/json"}
             )
-            return response.json()
+            
+            # Check if response is successful
+            response.raise_for_status()
+            
+            # Check if response has content
+            if not response.content:
+                return {"error": "Empty response from A2A server"}
+            
+            # Parse A2A response
+            try:
+                a2a_response = response.json()
+                
+                # Handle A2A error responses
+                if "error" in a2a_response:
+                    return {
+                        "error": f"A2A error: {a2a_response['error'].get('message', 'Unknown error')}",
+                        "code": a2a_response['error'].get('code', -1)
+                    }
+                
+                # Extract result from A2A response
+                result = a2a_response.get("result", {})
+                
+                # Extract message content from A2A response structure
+                if isinstance(result, dict) and "message" in result:
+                    message_result = result["message"]
+                    if isinstance(message_result, dict) and "parts" in message_result:
+                        # Extract text from parts
+                        text_parts = []
+                        for part in message_result["parts"]:
+                            if part.get("kind") == "text":
+                                text_parts.append(part.get("text", ""))
+                        return {"message": " ".join(text_parts)}
+                    else:
+                        return {"message": str(message_result)}
+                else:
+                    return {"message": str(result)}
+                
+            except ValueError as json_error:
+                return {
+                    "error": f"Invalid JSON response: {str(json_error)}",
+                    "raw_response": response.text,
+                    "status_code": response.status_code
+                }
+                
+        except httpx.HTTPStatusError as http_error:
+            return {
+                "error": f"HTTP error {http_error.response.status_code}: {http_error.response.text}",
+                "status_code": http_error.response.status_code
+            }
+        except httpx.RequestError as req_error:
+            return {
+                "error": f"Request error: {str(req_error)}",
+                "connection_error": True
+            }
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": f"Unexpected error: {str(e)}"}
     
     async def get_agent_card(self) -> Dict[str, Any]:
         """Get agent card information"""
@@ -290,20 +379,22 @@ class CustomerSupportSystem:
     def __init__(self):
         self.conversation_history = []
         self.current_ticket_id = None
+        self.a2a_client = a2a_client  # Initialize A2A client for vector store operations
     
     @traceable(name="process_customer_request")
     async def process_customer_request(self, customer_name: str, customer_email: str, request: str) -> str:
-        """Process customer support request through multi-agent system"""
+        """Process customer support request through A2A multi-agent system"""
         try:
             # Step 1: Send to A2A Triage Agent
             triage_response = await a2a_client.send_message(request, "triage")
             
             # Step 2: Based on triage, route to appropriate specialist
-            if "ESCALATED" in triage_response.get("message", ""):
+            triage_message = triage_response.get("message", "")
+            if "ESCALATED" in str(triage_message) or "URGENT" in str(triage_message):
                 specialist_response = await a2a_client.send_message(request, "escalation")
-            elif "TECHNICAL" in triage_response.get("message", ""):
+            elif "TECHNICAL" in str(triage_message) or "ERROR" in str(triage_message):
                 specialist_response = await a2a_client.send_message(request, "resolution")
-            elif "BILLING" in triage_response.get("message", ""):
+            elif "BILLING" in str(triage_message) or "PAYMENT" in str(triage_message):
                 specialist_response = await a2a_client.send_message(request, "resolution")
             else:
                 specialist_response = await a2a_client.send_message(request, "resolution")
@@ -330,33 +421,120 @@ class CustomerSupportSystem:
             
             email_response = await a2a_client.send_message(json.dumps(email_data), "email")
             
-            # Compile response
+            # Extract meaningful content from A2A responses
+            def extract_response_content(response_data):
+                """Extract meaningful content from A2A agent response"""
+                if isinstance(response_data, dict):
+                    # Try different possible response fields
+                    content = response_data.get('message') or response_data.get('content') or response_data.get('response')
+                    if isinstance(content, dict):
+                        # If content is a dict, try to extract solution or meaningful text
+                        return content.get('solution') or content.get('result') or str(content)
+                    elif isinstance(content, str):
+                        return content
+                    else:
+                        return str(response_data)
+                else:
+                    return str(response_data)
+            
+            # Extract meaningful content from each A2A response
+            triage_content = extract_response_content(triage_response)
+            specialist_content = extract_response_content(specialist_response)
+            doc_content = extract_response_content(doc_response)
+            email_content = extract_response_content(email_response)
+            
+            # Compile response with extracted A2A content
             response = f"""
                 🎯 **Triage Result:**
-                {triage_response.get('message', 'Processed')}
+                {triage_content[:200] + '...' if len(triage_content) > 200 else triage_content}
 
                 💡 **Solution:**
-                {specialist_response.get('message', 'Processing...')}
+                {specialist_content[:500] + '...' if len(specialist_content) > 500 else specialist_content}
 
                 📊 **Ticket Logged:**
-                {doc_response.get('message', 'Logged')}
+                {doc_content[:100] + '...' if len(doc_content) > 100 else doc_content}
 
                 📧 **Email Sent:**
-                {email_response.get('message', 'Sent')}
+                {email_content[:100] + '...' if len(email_content) > 100 else email_content}
                 """
             
             # Add to conversation history
             self.conversation_history.append({
                 "timestamp": datetime.now().isoformat(),
                 "customer": customer_name,
+                "email": customer_email,
                 "request": request,
-                "response": response
+                "response": response.strip()
             })
             
-            return response
+            # Automatically update FAQ vector store with new Q&A pair
+            await self._auto_update_faq(request, specialist_content)
+            
+            return response.strip()
             
         except Exception as e:
             return f"❌ Error processing request: {str(e)}"
+    
+    async def _auto_update_faq(self, question: str, answer: str) -> None:
+        """Automatically update FAQ vector store with new Q&A pair"""
+        try:
+            # Only add to FAQ if the answer is meaningful and not an error
+            if answer and len(answer.strip()) > 20 and "❌" not in answer and "Error" not in answer:
+                # Create FAQ entry in the format expected by the system
+                faq_entry = {
+                    "question": question.strip(),
+                    "answer": answer.strip(),
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                # Send to MCP Drive server to add to FAQ document and update vector store
+                await mcp_client.call_tool(
+                    mcp_client.drive_url,
+                    "add_faq_entry",
+                    **faq_entry
+                )
+                
+                print(f"✅ Auto-added FAQ entry: {question[:50]}...")
+        except Exception as e:
+            print(f"⚠️ Failed to auto-update FAQ: {str(e)}")
+            # Don't raise exception - FAQ update failure shouldn't break customer service
+    
+    def _classify_request_simple(self, request: str) -> dict:
+        """Simple triage classification for direct MCP bypass"""
+        request_lower = request.lower()
+        
+        # Escalation keywords
+        if any(word in request_lower for word in ["urgent", "critical", "emergency", "down", "outage", "broken"]):
+            return {
+                "category": "escalation",
+                "priority": "urgent",
+                "confidence": 0.9
+            }
+        
+        # Technical keywords
+        elif any(word in request_lower for word in ["error", "bug", "crash", "performance", "slow", "api", "integration", "login", "password"]):
+            priority = "high" if any(word in request_lower for word in ["crash", "error", "api"]) else "medium"
+            return {
+                "category": "technical",
+                "priority": priority,
+                "confidence": 0.8
+            }
+        
+        # Billing keywords
+        elif any(word in request_lower for word in ["billing", "payment", "invoice", "charge", "refund", "subscription"]):
+            return {
+                "category": "billing",
+                "priority": "medium",
+                "confidence": 0.8
+            }
+        
+        # General support
+        else:
+            return {
+                "category": "general",
+                "priority": "low",
+                "confidence": 0.6
+            }
     
     @traceable(name="get_active_tickets")
     async def get_active_tickets(self) -> str:
@@ -386,25 +564,31 @@ class CustomerSupportSystem:
         except Exception as e:
             return f"❌ Error searching knowledge base: {str(e)}"
 
-    async def initialize_faq_vectorstore(self) -> str:
-        """Initialize FAQ vector store"""
-        try:
-            # Initialize FAQ vector store
-            faq_result = await mcp_client.call_tool(
-                mcp_client.drive_url,
-                "initialize_faq_vectorstore"
-            )
-            return f"📈 **FAQ Vector Store Initialized:**\n{faq_result}"
-        except Exception as e:
-            return f"❌ Error initializing FAQ vector store: {str(e)}"
+
 
     async def initialize_kb_vectorstore(self, pdf_file_path: str) -> str:
         """Initialize KB vector store from uploaded PDF"""
         try:
-            # Call A2A server to initialize KB vector store
+            # Read the PDF file content and send it to backend
+            if not pdf_file_path or not os.path.exists(pdf_file_path):
+                return "❌ **KB Initialization Failed:**\nPDF file not found or invalid path"
+            
+            # Read PDF file as binary data
+            with open(pdf_file_path, 'rb') as pdf_file:
+                pdf_content = pdf_file.read()
+            
+            # Get filename from path
+            filename = os.path.basename(pdf_file_path)
+            
+            # Send PDF content as multipart form data to backend
+            files = {
+                'pdf_file': (filename, pdf_content, 'application/pdf')
+            }
+            
+            # Call A2A server to initialize KB vector store with file upload
             response = await self.a2a_client.client.post(
                 f"{self.a2a_client.server_url}/vector-store/kb/initialize",
-                params={"pdf_path": pdf_file_path}
+                files=files
             )
             result = response.json()
             
@@ -428,51 +612,63 @@ class CustomerSupportSystem:
         except Exception as e:
             return f"❌ Error getting vector store status: {str(e)}"
 
-    async def update_faq_vectorstore(self) -> str:
-        """Update FAQ vector store"""
-        try:
-            # Update FAQ vector store
-            update_result = await mcp_client.call_tool(
-                mcp_client.drive_url,
-                "update_faq_vectorstore"
-            )
-            return f"🔄 **FAQ Vector Store Updated:**\n{update_result}"
-        except Exception as e:
-            return f"❌ Error updating FAQ vector store: {str(e)}"
+
 
 # Initialize system
 support_system = CustomerSupportSystem()
 
-# Sync wrapper functions for Gradio
+# Sync wrapper functions for Gradio with robust event loop handling
+def run_async_safe(coro):
+    """Safely run async coroutine in sync context"""
+    try:
+        # Try to get the current event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If loop is running, we need to run in a thread
+            import concurrent.futures
+            import threading
+            
+            def run_in_thread():
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                try:
+                    return new_loop.run_until_complete(coro)
+                finally:
+                    new_loop.close()
+            
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(run_in_thread)
+                return future.result(timeout=60)  # 60 second timeout
+        else:
+            # If no loop is running, we can use asyncio.run
+            return asyncio.run(coro)
+    except RuntimeError:
+        # No event loop exists, create one
+        return asyncio.run(coro)
+    except Exception as e:
+        return f"❌ Error running async operation: {str(e)}"
+
 def process_request_sync(customer_name: str, customer_email: str, request_text: str) -> str:
     """Sync wrapper for processing support requests"""
-    return asyncio.run(support_system.process_customer_request(customer_name, customer_email, request_text))
-
-def get_status_sync() -> str:
-    """Sync wrapper for getting ticket status"""
-    return asyncio.run(support_system.get_ticket_status())
+    return run_async_safe(support_system.process_customer_request(customer_name, customer_email, request_text))
 
 def search_knowledge_sync(query: str) -> str:
     """Sync wrapper for knowledge base search"""
-    return asyncio.run(support_system.search_knowledge_base(query))
+    return run_async_safe(support_system.search_knowledge_base(query))
 
-def initialize_faq_vectorstore_sync() -> str:
-    """Sync wrapper for initializing FAQ vector store"""
-    return asyncio.run(support_system.initialize_faq_vectorstore())
+
 
 def initialize_kb_vectorstore_sync(pdf_file) -> str:
     """Sync wrapper for initializing KB vector store from uploaded PDF"""
     if pdf_file is None:
         return "❌ Please upload a PDF file first"
-    return asyncio.run(support_system.initialize_kb_vectorstore(pdf_file))
+    return run_async_safe(support_system.initialize_kb_vectorstore(pdf_file.name))
 
 def get_vectorstore_status_sync() -> str:
     """Sync wrapper for getting vector store status"""
-    return asyncio.run(support_system.get_vectorstore_status())
+    return run_async_safe(support_system.get_vectorstore_status())
 
-def update_faq_vectorstore_sync() -> str:
-    """Sync wrapper for updating FAQ vector store"""
-    return asyncio.run(support_system.update_faq_vectorstore())
+
 
 def get_conversation_history() -> str:
     """Get formatted conversation history"""
@@ -534,30 +730,31 @@ def create_gradio_interface():
                 outputs=response_output
             )
         
-        with gr.Tab("Ticket Management"):
-            gr.Markdown("## Ticket Status & Management")
+        # with gr.Tab("Ticket Management"):
+        #     gr.Markdown("## Ticket Status & Management")
             
-            status_btn = gr.Button("Get Active Tickets")
-            status_output = gr.Textbox(
-                label="Active Tickets",
-                lines=8,
-                interactive=False
-            )
+        #     status_btn = gr.Button("Get Active Tickets")
+        #     status_output = gr.Textbox(
+        #         label="Active Tickets",
+        #         lines=8,
+        #         interactive=False
+        #     )
             
-            status_btn.click(
-                fn=get_status_sync,
-                outputs=status_output
-            )
+        #     status_btn.click(
+        #         fn=get_status_sync,
+        #         outputs=status_output
+        #     )
         
         with gr.Tab("Vector Store Management"):
             gr.Markdown("## RAG Vector Store Management")
             
+            gr.Markdown("""
+            ### 🤖 **Automatic FAQ Management**
+            The FAQ vector store is automatically created and updated as new customer questions are processed.
+            No manual intervention required - the system learns from each interaction!
+            """)
+            
             with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### FAQ Vector Store")
-                    init_faq_btn = gr.Button("Initialize FAQ Vector Store", variant="primary")
-                    update_faq_btn = gr.Button("Update FAQ Vector Store")
-                    
                 with gr.Column():
                     gr.Markdown("### Knowledge Base Vector Store")
                     pdf_upload = gr.File(
@@ -575,16 +772,6 @@ def create_gradio_interface():
             )
             
             # Event handlers
-            init_faq_btn.click(
-                fn=initialize_faq_vectorstore_sync,
-                outputs=vector_output
-            )
-            
-            update_faq_btn.click(
-                fn=update_faq_vectorstore_sync,
-                outputs=vector_output
-            )
-            
             init_kb_btn.click(
                 fn=initialize_kb_vectorstore_sync,
                 inputs=[pdf_upload],
@@ -598,42 +785,6 @@ def create_gradio_interface():
         
         with gr.Tab("System Status"):
             gr.Markdown("## System Status & Conversation History")
-            
-            history_btn = gr.Button("Get Conversation History")
-            history_output = gr.Textbox(
-                label="Recent Conversations",
-                lines=10,
-                interactive=False
-            )
-            
-            history_btn.click(
-                fn=get_conversation_history,
-                outputs=history_output
-            )
-        
-        with gr.Tab("Knowledge Base"):
-            gr.Markdown("## Search Knowledge Base")
-            
-            search_input = gr.Textbox(
-                label="Search Query",
-                placeholder="Enter search terms...",
-                value="password reset"
-            )
-            search_btn = gr.Button("Search")
-            search_output = gr.Textbox(
-                label="Search Results",
-                lines=6,
-                interactive=False
-            )
-            
-            search_btn.click(
-                fn=search_kb_sync,
-                inputs=search_input,
-                outputs=search_output
-            )
-        
-        with gr.Tab("System Status"):
-            gr.Markdown("## System Information")
             
             with gr.Row():
                 with gr.Column():
@@ -649,20 +800,28 @@ def create_gradio_interface():
                     - **Resolution Agent**: Solution generation
                     - **Escalation Agent**: Complex issues
                     """)
+                    
+                    history_btn = gr.Button("Get Conversation History")
                 
                 with gr.Column():
                     history_output = gr.Textbox(
                         label="Recent Conversations",
-                        lines=8,
+                        lines=10,
                         interactive=False,
                         value=get_conversation_history()
                     )
                     
                     refresh_btn = gr.Button("Refresh History")
-                    refresh_btn.click(
-                        fn=get_conversation_history,
-                        outputs=history_output
-                    )
+            
+            # Connect buttons to functions
+            history_btn.click(
+                fn=get_conversation_history,
+                outputs=history_output
+            )
+            refresh_btn.click(
+                fn=get_conversation_history,
+                outputs=history_output
+            )
     
     return interface
 
